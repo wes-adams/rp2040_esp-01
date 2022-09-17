@@ -18,9 +18,6 @@
 #define BAUD_RATE (115200)
 #define LED_PIN   (25)
 #define BUF_MAX   (CFG_TUD_CDC_TX_BUFSIZE)
-
-#define us_to_ms(x) (x/1000)
-#define ms_to_us(x) (x*1000)
 //--------------------------------------------------------------------+
 enum dest {
     TO_ESP,
@@ -33,21 +30,25 @@ struct commands_t {
     bool (*f_ptr)(void *data);
 };
 
-struct char_buffers_t {
-    uint8_t rp2040[BUF_MAX];
-    uint16_t rp2040_buf_head;
-    uint8_t esp[BUF_MAX];
-    uint16_t esp_buf_head;
+struct buffer_t {
+    uint8_t data[BUF_MAX];
+    uint16_t head_ptr;
 };
+
+struct buffers_t {
+    struct buffer_t rp2040;
+    struct buffer_t to_esp;
+    struct buffer_t from_esp;
+};
+
 //--------------------------------------------------------------------+
 // static vars
 //--------------------------------------------------------------------+
+static struct buffers_t buffers;
+
 static const char CRNL[] = {'\r', '\n'};
-static struct char_buffers_t char_buffers;
 static enum dest direction = TO_RP2040;
 static bool already_printed_dest;
-static uint8_t from_socket[BUF_MAX];
-static uint16_t socket_head;
 static bool ready_for_proc;
 static bool g_timeout = false;
 static alarm_id_t alarm_id;
@@ -147,7 +148,7 @@ static void uart0_irq(void) {
         /* ignore \r */
         if (ch == 0x0D)
             return;
-        from_socket[socket_head++] = ch;
+        buffers.from_esp.data[buffers.from_esp.head_ptr++] = ch;
         if (ch == 0x0A) {
             ready_for_proc = true;
             return;
@@ -175,7 +176,7 @@ static bool check_commands(void)
     bool ret;
     uint8_t *buf;
 
-    buf = ((direction == TO_RP2040) ? char_buffers.rp2040 : char_buffers.esp);
+    buf = ((direction == TO_RP2040) ? buffers.rp2040.data : buffers.to_esp.data);
 
     for (unsigned i = 0; i < TU_ARRAY_SIZE(commands); i++) {
         if (strcmp(buf, commands[i].command) == 0) {
@@ -192,8 +193,8 @@ static bool check_commands(void)
 static void process_rp2040_msg(void)
 {
     check_commands();
-    memset(char_buffers.rp2040, 0, sizeof char_buffers.rp2040);
-    char_buffers.rp2040_buf_head = 0;
+    memset(buffers.rp2040.data, 0, sizeof buffers.rp2040.data);
+    buffers.rp2040.head_ptr = 0;
 }
 
 static void process_esp_msg(void)
@@ -201,13 +202,13 @@ static void process_esp_msg(void)
     print("process_esp_msg\r\n");
     if (!check_commands()) {
         /* add '\r' ,'\n' and '\0' to satisfy AT set */
-        char_buffers.esp[char_buffers.esp_buf_head - 1] = 0x0D;
-        char_buffers.esp[char_buffers.esp_buf_head++] = 0x0A;
-        char_buffers.esp[char_buffers.esp_buf_head++] = 0;
-        uart_puts(ESP_UART, char_buffers.esp);
+        buffers.to_esp.data[buffers.to_esp.head_ptr - 1] = 0x0D;
+        buffers.to_esp.data[buffers.to_esp.head_ptr++] = 0x0A;
+        buffers.to_esp.data[buffers.to_esp.head_ptr++] = 0;
+        uart_puts(ESP_UART, buffers.to_esp.data);
     }
-    memset(char_buffers.esp, 0, sizeof char_buffers.esp);
-    char_buffers.esp_buf_head = 0;
+    memset(buffers.to_esp.data, 0, sizeof buffers.to_esp.data);
+    buffers.to_esp.head_ptr = 0;
 }
 
 static void print_dest(void)
@@ -311,13 +312,13 @@ static bool catch_response(void)
         watchdog_update();
         if (ready_for_proc) {
             ready_for_proc = false;
-            ok_ptr = strstr(from_socket, ok);
+            ok_ptr = strstr(buffers.from_esp.data, ok);
             if (ok_ptr) {
                 ret = true;
                 cancel_alarm(alarm_id);
                 break;
             }
-            err_ptr = strstr(from_socket, error);
+            err_ptr = strstr(buffers.from_esp.data, error);
             if (err_ptr) {
                 cancel_alarm(alarm_id);
                 break;
@@ -330,8 +331,8 @@ static bool catch_response(void)
         }
         sleep_ms(1);
     }
-    memset(from_socket, 0, sizeof from_socket);
-    socket_head = 0;
+    memset(buffers.from_esp.data, 0, sizeof buffers.from_esp.data);
+    buffers.from_esp.head_ptr = 0;
     return ret;
 }
             
@@ -392,20 +393,20 @@ static void cdc_task(void)
 
         if (direction == TO_RP2040) {
             if (ch == 0x0D) {
-                char_buffers.rp2040[char_buffers.rp2040_buf_head++] = 0;
+                buffers.rp2040.data[buffers.rp2040.head_ptr++] = 0;
                 process_rp2040_msg();
                 already_printed_dest = false;
                 return;
             }
-            char_buffers.rp2040[char_buffers.rp2040_buf_head++] = ch;
+            buffers.rp2040.data[buffers.rp2040.head_ptr++] = ch;
         } else if (direction == TO_ESP) {
             if (ch == 0x0D) {
-                char_buffers.esp[char_buffers.esp_buf_head++] = 0;
+                buffers.to_esp.data[buffers.to_esp.head_ptr++] = 0;
                 process_esp_msg();
                 already_printed_dest = false;
                 return;
             }
-            char_buffers.esp[char_buffers.esp_buf_head++] = ch;
+            buffers.to_esp.data[buffers.to_esp.head_ptr++] = ch;
         }
     }
 }
