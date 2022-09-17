@@ -18,9 +18,6 @@
 #define BAUD_RATE (115200)
 #define LED_PIN   (25)
 #define BUF_MAX   (CFG_TUD_CDC_TX_BUFSIZE)
-
-#define us_to_ms(x) (x/1000)
-#define ms_to_us(x) (x*1000)
 //--------------------------------------------------------------------+
 enum dest {
     TO_ESP,
