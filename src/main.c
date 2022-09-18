@@ -8,6 +8,7 @@
 #include "pico/bootrom.h"
 #include "pico/multicore.h"
 #include "pico/time.h"
+#include "pico/util/queue.h"
 
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
@@ -53,10 +54,12 @@ static bool ready_for_proc;
 static bool g_timeout = false;
 static alarm_id_t alarm_id;
 static bool echo;
+static queue_t from_esp_queue;
 //--------------------------------------------------------------------+
 // static function prototypes
 //--------------------------------------------------------------------+
 static void local_led_init(void);
+static void local_queue_init(void);
 static void local_uart_init(void);
 static void local_wdog_init(void);
 static void cdc_task(void);
@@ -104,6 +107,11 @@ static void local_led_init(void)
     gpio_set_dir(LED_PIN, GPIO_OUT);
 }
 
+static void local_queue_init(void)
+{
+    queue_init(&from_esp_queue, sizeof (struct buffer_t), 32);
+}
+
 void core1_task(void)
 {
     while (!tusb_inited());
@@ -111,6 +119,7 @@ void core1_task(void)
     local_wdog_init();
     local_uart_init();
     local_led_init();
+    local_queue_init();
     
     //TODO:add command to report reset status
     if (watchdog_caused_reboot()) {
@@ -150,6 +159,9 @@ static void uart0_irq(void) {
             return;
         buffers.from_esp.data[buffers.from_esp.head_ptr++] = ch;
         if (ch == 0x0A) {
+            if (!queue_try_add(&from_esp_queue, &buffers.from_esp))
+                print("Error: from_esp_queue push FAILED\r\n");
+            buffers.from_esp.head_ptr = 0;
             ready_for_proc = true;
             return;
         }
@@ -207,6 +219,9 @@ static void process_esp_msg(void)
         buffers.to_esp.data[buffers.to_esp.head_ptr++] = 0;
         uart_puts(ESP_UART, buffers.to_esp.data);
     }
+
+    struct buffer_t tmp;
+    while(!queue_try_remove(&from_esp_queue, &tmp));
     memset(buffers.to_esp.data, 0, sizeof buffers.to_esp.data);
     buffers.to_esp.head_ptr = 0;
 }
@@ -252,7 +267,7 @@ static bool d(void *data)
     bool ret;
 
     ret = send_and_catch_resp("AT\r\n", 10000);
-    print("%s :: %d :: %b\r\n", __func__, __LINE__, ret);
+    print("%s :: %d :: %s\r\n", __func__, __LINE__, ret ? "SUCCESS" : "FAILURE");
     return ret;
 }
 
@@ -305,20 +320,25 @@ static bool catch_response(void)
     char *err_ptr;
     bool ret = false;
     /* target = "\n, \r, O, K, \n, \a, \0" */
-    const char ok[] = {0x0A, 0x4F, 0x4B, 0x0A, 0};
-    const char error[] = {0x0A, 0x45, 0x52, 0x52, 0x4F, 0x52, 0x0A, 0};
+    const char ok[] = {0x4F, 0x4B, 0x0A, 0x0};
+    const char error[] = {0x45, 0x52, 0x52, 0x4F, 0x52, 0x0A, 0x0};
    
     while (true) {
         watchdog_update();
         if (ready_for_proc) {
-            ready_for_proc = false;
-            ok_ptr = strstr(buffers.from_esp.data, ok);
+
+            struct buffer_t from_esp;
+            if (!queue_try_remove(&from_esp_queue, &from_esp)) {
+                ready_for_proc = false;
+            }
+
+            ok_ptr = strstr(from_esp.data, ok);
             if (ok_ptr) {
                 ret = true;
                 cancel_alarm(alarm_id);
                 break;
             }
-            err_ptr = strstr(buffers.from_esp.data, error);
+            err_ptr = strstr(from_esp.data, error);
             if (err_ptr) {
                 cancel_alarm(alarm_id);
                 break;
@@ -326,7 +346,7 @@ static bool catch_response(void)
         }
         if (g_timeout) {
             g_timeout = false;
-            print("FAILURE\r\n");
+            print("Error :: repsonse from esp-1 timed out\r\n");
             break;
         }
         sleep_ms(1);
@@ -349,9 +369,8 @@ static bool usage(void *data)
                       " e - List visible wi-fi APs\r\n",
                       " f - Show IP addr\r\n",
                       " r - reset RP2040 into bootrom\r\n"};
-    for (unsigned i=0; i<4; i++) { 
-        tud_cdc_write(usage[i], strlen(usage[i]));
-        tud_cdc_write_flush();
+    for (unsigned i=0; i<7; i++) { 
+        print(usage[i]);
     }
 }
 

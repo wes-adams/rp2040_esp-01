@@ -23,6 +23,7 @@ add_executable(main
 target_link_libraries(main
                       pico_multicore
                       pico_stdlib
+                      pico_util
                       hardware_gpio
                       hardware_uart
                       hardware_watchdog
