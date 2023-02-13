@@ -10,13 +10,18 @@
 #include "pico/time.h"
 #include "pico/util/queue.h"
 
+#include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
+#include "hardware/pio.h"
 #include "hardware/uart.h"
 #include "hardware/watchdog.h"
 
+#include "ws2812.pio.h"
+
 #define ESP_UART  (uart0)
 #define BAUD_RATE (115200)
+#define RGB_PIN   (2)
 #define LED_PIN   (25)
 #define BUF_MAX   (CFG_TUD_CDC_TX_BUFSIZE)
 //--------------------------------------------------------------------+
@@ -47,22 +52,25 @@ struct buffers_t {
 //--------------------------------------------------------------------+
 static struct buffers_t buffers;
 
-static const char CRNL[] = {'\r', '\n'};
+static PIO pio = pio0;
+static uint sm;
 static enum dest direction = TO_RP2040;
 static bool already_printed_dest;
 static bool ready_for_proc;
 static bool g_timeout = false;
 static alarm_id_t alarm_id;
-static bool echo;
 static queue_t from_esp_queue;
+static bool reset_needed;
 //--------------------------------------------------------------------+
 // static function prototypes
 //--------------------------------------------------------------------+
 static void local_led_init(void);
+static void local_rgb_init(void);
 static void local_queue_init(void);
 static void local_uart_init(void);
 static void local_wdog_init(void);
 static void cdc_task(void);
+static uint32_t rgb_task(uint8_t red, uint8_t green, uint8_t blue);
 static void process_rp2040_msg(void);
 static void process_esp_msg(void);
 static bool print(const char *fmt, ...);
@@ -70,6 +78,7 @@ static void print_dest(void);
 static void uart0_irq(void);
 static bool send_and_catch_resp(const char *at_cmd, uint32_t timeout);
 static bool catch_response(void);
+static void process_ipd(char *ptr);
 
 static bool a(void *data);
 static bool b(void *data);
@@ -79,26 +88,47 @@ static bool e(void *data);
 static bool f(void *data);
 static bool g(void *data);
 static bool h(void *data);
+static bool red(void *data);
+static bool green(void *data);
+static bool blue(void *data);
 static bool usage(void *data);
 static bool reset(void *data);
 //--------------------------------------------------------------------+
 static struct commands_t commands[] = {
-    {"a", "LED on", &a},
-    {"b", "LED off", &b},
-    {"c", "Switch interface", &c},
-    {"d", "AT", &d},
-    {"e", "AT+CWLAP", &e},
-    {"f", "AT+CIFSR", &f},
-    {"g", "AT+CIPMUX=1", &g},
-    {"h", "AT+CIPSERVER=1,333", &h},
-    {"r", "reset RP2040", &reset},
-    {"?", "usage", &usage},
+    { "a", "LED on", &a },
+    { "b", "LED off", &b },
+    { "c", "Switch interface", &c },
+    { "d", "AT", &d },
+    { "e", "AT+CWLAP", &e },
+    { "f", "AT+CIFSR", &f },
+    { "g", "AT+CIPMUX=1", &g },
+    { "h", "AT+CIPSERVER=1,333", &h },
+    { "red", "RGB RED", &red },
+    { "green", "RGB GREEN", &green },
+    { "blue", "RGB BLUE", &blue },
+    { "r", "reset RP2040", &reset },
+    { "?", "usage", &usage },
 };
 //--------------------------------------------------------------------+
 int64_t alarm_cb(alarm_id_t id, void *user_data)
 {
     print("alarm fired\r\n");
     g_timeout = true;
+}
+
+static uint32_t rgb_task(uint8_t red, uint8_t green, uint8_t blue)
+{
+    uint32_t rgb = (red << 16) | (blue << 8) | (green << 24);
+    print("rgb :: 0x%06X\r\n", rgb);
+    print("rgb :: %u\r\n", rgb);
+    pio_sm_put_blocking(pio, sm, rgb);
+}
+
+static void local_rgb_init(void)
+{
+    uint offset = pio_add_program(pio, &ws2812_program);
+    sm = pio_claim_unused_sm(pio, true);
+    ws2812_program_init(pio, sm, offset, RGB_PIN, 1, false);
 }
 
 static void local_led_init(void)
@@ -109,18 +139,18 @@ static void local_led_init(void)
 
 static void local_queue_init(void)
 {
-    queue_init(&from_esp_queue, sizeof (struct buffer_t), 32);
+    queue_init(&from_esp_queue, sizeof(struct buffer_t), 32);
 }
 
 void core1_task(void)
 {
     while (!tusb_inited());
-    
     local_wdog_init();
     local_uart_init();
     local_led_init();
     local_queue_init();
-    
+    local_rgb_init();
+
     //TODO:add command to report reset status
     if (watchdog_caused_reboot()) {
         print("Rebooted by Watchdog!\r\n");
@@ -132,6 +162,8 @@ void core1_task(void)
         print_dest();
         cdc_task();
         watchdog_update();
+        if (reset_needed)
+            reset_usb_boot(0, 1);
     }
     return;
 }
@@ -149,7 +181,23 @@ int main(void)
     return 0;
 }
 
-static void uart0_irq(void) {
+static void process_ipd(char *ptr)
+{
+    char *start_of_id = strchr(ptr, ',');
+    print("%c\r\n", *start_of_id++);
+    print("%c\r\n", *start_of_id);
+    char *start_of_len = strchr(start_of_id, ',');
+    start_of_len++;
+    print("%c\r\n", *start_of_len++);
+    print("%c\r\n", *start_of_len++);
+    print("%c\r\n", *start_of_len);
+
+}
+
+static void uart0_irq(void)
+{
+    char *ipd_ptr;
+    const char ipd[] = { 0x49, 0x50, 0x44, 0x0 };
     static uint8_t count = 0;
     if (uart_is_readable(ESP_UART)) {
         uint8_t ch = uart_getc(ESP_UART);
@@ -159,6 +207,13 @@ static void uart0_irq(void) {
             return;
         buffers.from_esp.data[buffers.from_esp.head_ptr++] = ch;
         if (ch == 0x0A) {
+            ipd_ptr = strstr(buffers.from_esp.data, ipd);
+            /* +IPD,0,19:GET / HTTP/1.1 */
+            if (ipd_ptr) {
+                process_ipd(ipd_ptr);
+                return;
+            }
+
             if (!queue_try_add(&from_esp_queue, &buffers.from_esp))
                 print("Error: from_esp_queue push FAILED\r\n");
             buffers.from_esp.head_ptr = 0;
@@ -188,7 +243,8 @@ static bool check_commands(void)
     bool ret;
     uint8_t *buf;
 
-    buf = ((direction == TO_RP2040) ? buffers.rp2040.data : buffers.to_esp.data);
+    buf = ((direction == TO_RP2040) ? buffers.rp2040.data :
+                                      buffers.to_esp.data);
 
     for (unsigned i = 0; i < TU_ARRAY_SIZE(commands); i++) {
         if (strcmp(buf, commands[i].command) == 0) {
@@ -200,7 +256,6 @@ static bool check_commands(void)
     }
     return false;
 }
-
 
 static void process_rp2040_msg(void)
 {
@@ -234,7 +289,8 @@ static void print_dest(void)
     }
 }
 
-static bool print(const char *fmt, ...) {
+static bool print(const char *fmt, ...)
+{
     unsigned count = 0;
     char ascii[BUF_MAX];
     va_list va;
@@ -267,7 +323,8 @@ static bool d(void *data)
     bool ret;
 
     ret = send_and_catch_resp("AT\r\n", 10000);
-    print("%s :: %d :: %s\r\n", __func__, __LINE__, ret ? "SUCCESS" : "FAILURE");
+    print("%s :: %d :: %s\r\n", __func__, __LINE__,
+          ret ? "SUCCESS" : "FAILURE");
     return ret;
 }
 
@@ -307,6 +364,21 @@ static bool h(void *data)
     return ret;
 }
 
+static bool red(void *data)
+{
+    rgb_task(0xFF, 0, 0);
+}
+
+static bool green(void *data)
+{
+    rgb_task(0, 0xFF, 0);
+}
+
+static bool blue(void *data)
+{
+    rgb_task(0, 0, 0xFF);
+}
+
 static bool send_and_catch_resp(const char *at_cmd, uint32_t timeout)
 {
     alarm_id = add_alarm_in_ms(timeout, alarm_cb, NULL, true);
@@ -320,13 +392,12 @@ static bool catch_response(void)
     char *err_ptr;
     bool ret = false;
     /* target = "\n, \r, O, K, \n, \a, \0" */
-    const char ok[] = {0x4F, 0x4B, 0x0A, 0x0};
-    const char error[] = {0x45, 0x52, 0x52, 0x4F, 0x52, 0x0A, 0x0};
-   
+    const char ok[] = { 0x4F, 0x4B, 0x0A, 0x0 };
+    const char error[] = { 0x45, 0x52, 0x52, 0x4F, 0x52, 0x0A, 0x0 };
+
     while (true) {
         watchdog_update();
         if (ready_for_proc) {
-
             struct buffer_t from_esp;
             if (!queue_try_remove(&from_esp_queue, &from_esp)) {
                 ready_for_proc = false;
@@ -355,21 +426,21 @@ static bool catch_response(void)
     buffers.from_esp.head_ptr = 0;
     return ret;
 }
-            
+
 static bool usage(void *data)
 {
     /* 
      * split usage into chunks because CDCACM driver supports
      * 64 bytes max
      */
-    char *usage[7] = {" a - LED on\r\n",
-                      " b - LED off\r\n",
-                      " c - Switch interface RP2040/ESP-1\r\n",
-                      " d - Ping ESP-1 UART\r\n",
-                      " e - List visible wi-fi APs\r\n",
-                      " f - Show IP addr\r\n",
-                      " r - reset RP2040 into bootrom\r\n"};
-    for (unsigned i=0; i<7; i++) { 
+    char *usage[7] = { " a - LED on\r\n",
+                       " b - LED off\r\n",
+                       " c - Switch interface RP2040/ESP-1\r\n",
+                       " d - Ping ESP-1 UART\r\n",
+                       " e - List visible wi-fi APs\r\n",
+                       " f - Show IP addr\r\n",
+                       " r - reset RP2040 into bootrom\r\n" };
+    for (unsigned i = 0; i < 7; i++) {
         print(usage[i]);
     }
 }
@@ -377,14 +448,11 @@ static bool usage(void *data)
 static bool reset(void *data)
 {
     print("%s :: %u\r\n", __func__, __LINE__);
-    sleep_ms(1000);
-    reset_usb_boot(0, 1);
+    reset_needed = true;
 }
 //--------------------------------------------------------------------+
 // WEB SERVER
 //--------------------------------------------------------------------+
-
-
 
 //--------------------------------------------------------------------+
 // USB CDC
@@ -400,11 +468,6 @@ static void cdc_task(void)
 
         if (count < 1)
             return;
-      
-        if (echo) {
-            tud_cdc_write(&ch, sizeof ch);
-            tud_cdc_write_flush();
-        }
 
         /* ignore \r */
         if (ch == 0x0A)

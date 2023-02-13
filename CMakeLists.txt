@@ -19,12 +19,15 @@ add_executable(main
         src/usb_descriptors.c
         )
 
+pico_generate_pio_header(main ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
+
 # pull in common dependencies
 target_link_libraries(main
                       pico_multicore
                       pico_stdlib
                       pico_util
                       hardware_gpio
+                      hardware_pio
                       hardware_uart
                       hardware_watchdog
                       tinyusb_device)
